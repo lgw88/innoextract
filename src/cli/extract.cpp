@@ -366,6 +366,23 @@ void print_checksum_info(const stream::file & file, const crypto::checksum * che
 	std::cout << color::dim_magenta << *checksum << color::reset;
 }
 
+void print_file_details(const extract_options & o, const stream::file & file, const stream::chunk & chunk,
+                        boost::uint64_t size, const crypto::checksum * checksum, const std::string & key) {
+	
+	if(o.list_sizes) {
+		print_size_info(file, size);
+	}
+	if(o.list_checksums) {
+		std::cout << ' ';
+		print_checksum_info(file, checksum);
+	}
+	if(chunk.encryption != stream::Plaintext && key.empty()) {
+		std::cout << " - encrypted";
+	}
+	std::cout << '\n';
+	
+}
+
 bool prompt_overwrite() {
 	return true; // TODO the user always overwrites
 }
@@ -1177,17 +1194,25 @@ void process_file(const fs::path & installer, const extract_options & o) {
 						if(output.second != 0) {
 							continue;
 						}
+						bool mismatch = false;
 						if(output.first->entry().size != 0) {
 							if(size != 0 && size != output.first->entry().size) {
-								log_warning << "Mismatched output sizes";
+								mismatch = true;
 							}
 							size = output.first->entry().size;
 						}
 						if(output.first->entry().checksum.type != crypto::None) {
 							if(checksum && *checksum != output.first->entry().checksum) {
-								log_warning << "Mismatched output checksums";
+								mismatch = true;
 							}
 							checksum = &output.first->entry().checksum;
+						}
+						if(mismatch) {
+							// Different file even though the starting location is the same
+							if(named) {
+								print_file_details(o, file, chunk.first, size, checksum, key);
+								named = false;
+							}
 						}
 						if(named) {
 							std::cout << ", ";
@@ -1208,17 +1233,7 @@ void process_file(const fs::path & installer, const extract_options & o) {
 					}
 					
 					if(named) {
-						if(o.list_sizes) {
-							print_size_info(file, size);
-						}
-						if(o.list_checksums) {
-							std::cout << ' ';
-							print_checksum_info(file, checksum);
-						}
-						if(chunk.first.encryption != stream::Plaintext && key.empty()) {
-							std::cout << " - encrypted";
-						}
-						std::cout << '\n';
+						print_file_details(o, file, chunk.first, size, checksum, key);
 					}
 					
 				} else {
@@ -1266,7 +1281,8 @@ void process_file(const fs::path & installer, const extract_options & o) {
 			
 			// Open output files
 			boost::ptr_vector<file_output> single_outputs;
-			std::vector<file_output *> outputs;
+			typedef std::pair<file_output *, boost::uint64_t> file_output_location;
+			std::vector<file_output_location> outputs;
 			BOOST_FOREACH(const output_location & output_loc, output_locations) {
 				const processed_file * fileinfo = output_loc.first;
 				try {
@@ -1293,9 +1309,7 @@ void process_file(const fs::path & installer, const extract_options & o) {
 						}
 					}
 					
-					outputs.push_back(output);
-					
-					output->seek(output_loc.second);
+					outputs.push_back(file_output_location(output, output_loc.second));
 					
 				} catch(boost::bad_pointer &) {
 					// should never happen
@@ -1310,7 +1324,9 @@ void process_file(const fs::path & installer, const extract_options & o) {
 				std::streamsize buffer_size = std::streamsize(boost::size(buffer));
 				std::streamsize n = file_source->read(buffer, buffer_size).gcount();
 				if(n > 0) {
-					BOOST_FOREACH(file_output * output, outputs) {
+					BOOST_FOREACH(file_output_location & out, outputs) {
+						file_output * output = out.first;
+						output->seek(out.second + output_size);
 						bool success = output->write(buffer, size_t(n));
 						if(!success) {
 							throw std::runtime_error("Error writing file \"" + output->path().string() + '"');
@@ -1332,9 +1348,10 @@ void process_file(const fs::path & installer, const extract_options & o) {
 				filetime = util::to_local_time(filetime);
 			}
 			
-			BOOST_FOREACH(file_output * output, outputs) {
+			BOOST_FOREACH(file_output_location & out, outputs) {
+				file_output * output = out.first;
 				
-				if(output->file()->is_multipart() && !output->is_complete()) {
+				if(!output || (output->file()->is_multipart() && !output->is_complete())) {
 					continue;
 				}
 				
@@ -1356,6 +1373,12 @@ void process_file(const fs::path & installer, const extract_options & o) {
 					output->close();
 					if(!util::set_file_time(output->path(), filetime, data.timestamp_nsec)) {
 						log_warning << "Error setting timestamp on file " << output->path();
+					}
+				}
+				
+				BOOST_FOREACH(file_output_location & other, outputs) {
+					if(other.first == output) {
+						other.first = NULL;
 					}
 				}
 				
